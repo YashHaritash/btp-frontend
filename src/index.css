@@ -1,0 +1,8 @@
+/* Custom pointer styles */
+Link {
+  cursor: pointer;
+}
+
+.text-limegreen {
+  color: #32CD32; /* Bright Lime Green */
+}
