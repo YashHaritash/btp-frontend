@@ -37,6 +37,9 @@ const CodeEditor = () => {
   const [showFileExplorer, setShowFileExplorer] = useState(true);
   const [newFileName, setNewFileName] = useState("");
 
+  // Typing indicators state
+  const [typingUsers, setTypingUsers] = useState(new Set());
+  const [typingTimeouts, setTypingTimeouts] = useState(new Map());
   const token = localStorage.getItem("token");
   const navigate = useNavigate();
 
@@ -368,14 +371,46 @@ const CodeEditor = () => {
         const newSocket = io(SOCKET_URL);
         setSocket(newSocket);
         newSocket.emit("joinSession", sessionId);
-        newSocket.on("code", (updatedCode) => {
-          setCode(updatedCode);
-          // Update file content cache if there's an active file
-          if (activeFile) {
+        newSocket.on("code", (data) => {
+          console.log("🔥 RAW SOCKET DATA RECEIVED:", data);
+
+          // Handle both old format (string) and new format (object)
+          let updatedCode, fileName, userName;
+
+          if (typeof data === "string") {
+            // Legacy format: just the code string
+            updatedCode = data;
+          } else if (typeof data === "object" && data.code) {
+            // New format: object with code and fileName
+            updatedCode = data.code;
+            fileName = data.fileName;
+            userName = data.userName;
+          }
+
+          console.log("🔄 PROCESSING UPDATE:", {
+            updatedCode: updatedCode?.substring(0, 50) + "...",
+            fileName,
+            userName,
+            currentActiveFile: activeFile?.name,
+          });
+
+          // Always update the code if it's for the current file or no specific file
+          if (!fileName || !activeFile || fileName === activeFile.name) {
+            console.log("✅ UPDATING EDITOR CODE");
+            setCode(updatedCode);
+          }
+
+          // Update file content cache
+          if (fileName) {
             setFileContents((prev) => ({
               ...prev,
-              [activeFile.name]: updatedCode,
+              [fileName]: updatedCode,
             }));
+          }
+
+          // Show who made the change
+          if (userName) {
+            console.log(`👤 ${userName} made changes`);
           }
         });
 
@@ -390,11 +425,85 @@ const CodeEditor = () => {
           toast.info(`File ${fileName} was deleted`);
         });
 
-        newSocket.on("fileContentChanged", ({ fileName, content }) => {
-          setFileContents((prev) => ({ ...prev, [fileName]: content }));
-          if (activeFile?.name === fileName) {
-            setCode(content);
+        newSocket.on(
+          "fileContentChanged",
+          ({ fileName, content, userName }) => {
+            console.log("📁 FILE CONTENT CHANGED:", {
+              fileName,
+              contentLength: content?.length,
+              userName,
+            });
+
+            // Update file content cache
+            setFileContents((prev) => ({ ...prev, [fileName]: content }));
+
+            // If this is the currently active file, update the editor
+            if (activeFile?.name === fileName) {
+              console.log("✅ UPDATING ACTIVE FILE:", fileName);
+              setCode(content);
+            }
+
+            // Show notification about who made the change
+            // if (userName) {
+            //   toast.info(`${userName} updated ${fileName}`, {
+            //     autoClose: 2000,
+            //   });
+            // }
           }
+        );
+
+        // Handle typing events for concurrent typing indicators
+        newSocket.on("userTyping", ({ userName }) => {
+          console.log("User typing:", userName);
+
+          setTypingUsers((prev) => {
+            const newSet = new Set(prev);
+            newSet.add(userName);
+            return newSet;
+          });
+
+          // Clear existing timeout for this user
+          setTypingTimeouts((prev) => {
+            const newTimeouts = new Map(prev);
+            if (newTimeouts.has(userName)) {
+              clearTimeout(newTimeouts.get(userName));
+            }
+
+            // Set new timeout to remove user after 3 seconds of no typing
+            const timeoutId = setTimeout(() => {
+              setTypingUsers((currentUsers) => {
+                const updatedSet = new Set(currentUsers);
+                updatedSet.delete(userName);
+                return updatedSet;
+              });
+
+              setTypingTimeouts((currentTimeouts) => {
+                const updatedTimeouts = new Map(currentTimeouts);
+                updatedTimeouts.delete(userName);
+                return updatedTimeouts;
+              });
+            }, 3000);
+
+            newTimeouts.set(userName, timeoutId);
+            return newTimeouts;
+          });
+        });
+
+        newSocket.on("userStoppedTyping", ({ userName }) => {
+          setTypingUsers((prev) => {
+            const newSet = new Set(prev);
+            newSet.delete(userName);
+            return newSet;
+          });
+
+          setTypingTimeouts((prev) => {
+            const newTimeouts = new Map(prev);
+            if (newTimeouts.has(userName)) {
+              clearTimeout(newTimeouts.get(userName));
+              newTimeouts.delete(userName);
+            }
+            return newTimeouts;
+          });
         });
 
         // Store the last typing timestamp for each user
@@ -509,6 +618,8 @@ const CodeEditor = () => {
     fetchSessionData();
 
     return () => {
+      // Cleanup all timeouts
+      typingTimeouts.forEach((timeoutId) => clearTimeout(timeoutId));
       if (socket) {
         socket.disconnect();
       }
@@ -516,9 +627,11 @@ const CodeEditor = () => {
         suggestionSocket.close();
       }
     };
-  }, [sessionId, token]);
+  }, [sessionId, token, activeFile]); // Add activeFile to dependencies
 
   const handleCodeChange = (newCode) => {
+    console.log("📝 CODE CHANGE FROM USER:", newCode.substring(0, 50) + "...");
+
     setCode(newCode);
 
     // Update file content cache
@@ -527,21 +640,32 @@ const CodeEditor = () => {
     }
 
     const name = localStorage.getItem("name");
-    if (socket) {
+    if (socket && name) {
+      console.log("📤 EMITTING CODE CHANGE:", {
+        fileName: activeFile?.name,
+        codeLength: newCode.length,
+        userName: name,
+      });
+
+      // Emit code change
       socket.emit("code", {
         sessionId,
         code: newCode,
         name,
-        fileName: activeFile?.name, // Include current file name
+        fileName: activeFile?.name,
+      });
+
+      // Emit typing indicator
+      socket.emit("userTyping", {
+        sessionId,
+        userName: name,
       });
     }
 
-    // Get AI suggestion with debouncing - reduced threshold for faster suggestions
+    // Get AI suggestion with debouncing
     if (newCode.trim().length >= 3) {
-      // Reduced from 10 to 3 characters
       debounceGetSuggestion(newCode);
     } else {
-      // Clear suggestions immediately for short code
       setAiSuggestion("");
       setShowSuggestion(false);
     }
@@ -647,42 +771,37 @@ const CodeEditor = () => {
     if (activeFile) {
       await saveFile();
     }
-
+    // Route execution to the backend for each language. Include all open files as `allFiles`.
     if (language === "c_cpp") {
       try {
         const response = await axios.post(`${API_URL}/run-cpp`, {
           code,
           fileName: activeFile?.name || "main.cpp",
+          allFiles: fileContents,
         });
         setOutput(response.data.output || "No output");
       } catch (error) {
         setOutput(error.response?.data?.error || "Error running code");
       }
     } else if (language === "javascript") {
-      // Existing JavaScript execution logic
-      const logMessages = [];
-      const originalConsoleLog = console.log;
-
-      console.log = (message) => {
-        logMessages.push(`Log: ${message}`);
-        originalConsoleLog(message);
-      };
-
+      // Send JS execution to backend instead of running in the browser
       try {
-        const result = new Function(code)();
-        if (result !== undefined) {
-          logMessages.push(`Result: ${result}`);
-        }
+        const response = await axios.post(`${API_URL}/run-javascript`, {
+          code,
+          fileName: activeFile?.name || "main.js",
+          sessionId,
+          allFiles: fileContents,
+        });
+        setOutput(response.data.output || "No output");
       } catch (error) {
-        logMessages.push(`Error caught: ${error.message}`);
-      } finally {
-        setOutput(logMessages.join("\n"));
-        console.log = originalConsoleLog;
+        setOutput(error.response?.data?.error || "Error running code");
       }
     } else if (language === "python") {
       try {
         const response = await axios.post(`${API_URL}/run-python`, {
           code,
+          fileName: activeFile?.name || "main.py",
+          allFiles: fileContents,
         });
         setOutput(response.data.output || "No output");
       } catch (error) {
@@ -692,6 +811,8 @@ const CodeEditor = () => {
       try {
         const response = await axios.post(`${API_URL}/run-c`, {
           code,
+          fileName: activeFile?.name || "main.c",
+          allFiles: fileContents,
         });
         setOutput(response.data.output || "No output");
       } catch (error) {
@@ -701,6 +822,8 @@ const CodeEditor = () => {
       try {
         const response = await axios.post(`${API_URL}/run-java`, {
           code,
+          fileName: activeFile?.name || "Main.java",
+          allFiles: fileContents,
         });
         setOutput(response.data.output || "No output");
       } catch (error) {
@@ -745,7 +868,7 @@ const CodeEditor = () => {
       });
   };
 
-  const numberOfUsers = mySet.size;
+  const numberOfTypingUsers = typingUsers.size;
 
   return (
     <div
@@ -771,6 +894,47 @@ const CodeEditor = () => {
       >
         <div style={{ display: "flex", alignItems: "center" }}>
           <ChatBox sessionId={sessionId} />
+
+          {/* Typing Indicators - Moved to top bar for prominence */}
+          {numberOfTypingUsers > 0 && (
+            <div
+              style={{
+                marginLeft: "20px",
+                display: "flex",
+                alignItems: "center",
+                backgroundColor: "#4a5568",
+                padding: "4px 12px",
+                borderRadius: "12px",
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center" }}>
+                {Array.from(typingUsers).map((name, index) => (
+                  <span
+                    key={name}
+                    className="badge me-1"
+                    style={{
+                      backgroundColor: "#48bb78",
+                      color: "white",
+                      fontSize: "10px",
+                      animation: "pulse 1.5s infinite",
+                    }}
+                  >
+                    {name}
+                  </span>
+                ))}
+                <span
+                  style={{
+                    color: "#e2e8f0",
+                    fontSize: "11px",
+                    marginLeft: "8px",
+                    fontStyle: "italic",
+                  }}
+                >
+                  {numberOfTypingUsers === 1 ? "is typing..." : "are typing..."}
+                </span>
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="d-flex justify-content-center align-items-center">
@@ -1080,41 +1244,6 @@ const CodeEditor = () => {
               </div>
             )}
 
-            <div
-              className="d-flex justify-content-center mb-3"
-              style={{ backgroundColor: "#1a202c" }}
-            >
-              <div className="d-flex align-items-center">
-                {Array.from(mySet).map((name) => (
-                  <span
-                    key={name + " "}
-                    className="badge me-2"
-                    style={{
-                      backgroundColor: "#6b7280",
-                      color: "white",
-                      fontSize: "11px",
-                    }}
-                  >
-                    {name}
-                  </span>
-                ))}
-
-                {/* Ensure the space is always there to prevent layout shift */}
-                <span
-                  className="ms-2"
-                  style={{ color: "#a0aec0", fontSize: "12px" }}
-                >
-                  {numberOfUsers === 0 ? (
-                    <span>&nbsp;</span> // Render a non-breaking space if no users are typing
-                  ) : numberOfUsers === 1 ? (
-                    "is typing"
-                  ) : (
-                    "are typing"
-                  )}
-                </span>
-              </div>
-            </div>
-
             <AceEditor
               ref={editorRef}
               mode={language == "c" ? "c_cpp" : language}
@@ -1271,6 +1400,15 @@ const CodeEditor = () => {
           </div>
         </div>
       </div>
+
+      <style>
+        {`
+          @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+          }
+        `}
+      </style>
     </div>
   );
 };
